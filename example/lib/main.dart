@@ -25,9 +25,9 @@ class _MyAppState extends State<MyApp> {
     String platformVersion;
     // Platform messages may fail, so we use a try/catch PlatformException.
     try {
-      await Revenuecat.setDebugLogsEnabled(true);
-      await Revenuecat.configure(apiKey: 'YOUR_API_KEY', appUserID: null);
-      final e = Revenuecat.getEntitlements();
+      await RevenueCat.setup('LZHkDXvUJekCUehjepKgjtkfuUZHhfMa', null);
+      final e = await RevenueCat.getEntitlements();
+      print(e);
     } on PlatformException {
       platformVersion = 'Failed to get platform version.';
     }

@@ -1,167 +1,381 @@
 package com.tapkain.revenuecat;
 
-import androidx.annotation.NonNull;
-import io.flutter.plugin.common.MethodCall;
-import io.flutter.plugin.common.MethodChannel;
-import io.flutter.plugin.common.MethodChannel.MethodCallHandler;
-import io.flutter.plugin.common.MethodChannel.Result;
-import io.flutter.plugin.common.PluginRegistry.Registrar;
-
-import com.android.billingclient.api.BillingClient;
 import com.android.billingclient.api.SkuDetails;
 import com.revenuecat.purchases.Entitlement;
 import com.revenuecat.purchases.Offering;
 import com.revenuecat.purchases.PurchaserInfo;
 import com.revenuecat.purchases.Purchases;
-import com.revenuecat.purchases.PurchasesError;
-import com.revenuecat.purchases.interfaces.PurchaseCompletedListener;
-import com.revenuecat.purchases.interfaces.ReceiveEntitlementsListener;
-import com.revenuecat.purchases.interfaces.ReceivePurchaserInfoListener;
+import com.revenuecat.purchases.Purchases.PurchasesListener;
+import com.revenuecat.purchases.util.Iso8601Utils;
+
+import org.jetbrains.annotations.NotNull;
+import org.jetbrains.annotations.Nullable;
+import org.json.JSONArray;
+import org.json.JSONException;
+import org.json.JSONObject;
 
 import java.util.ArrayList;
+import java.util.Date;
 import java.util.HashMap;
+import java.util.Iterator;
 import java.util.List;
 import java.util.Map;
 
+import io.flutter.plugin.common.MethodCall;
+import io.flutter.plugin.common.MethodChannel;
+import io.flutter.plugin.common.MethodChannel.MethodCallHandler;
+import io.flutter.plugin.common.MethodChannel.Result;
+import io.flutter.plugin.common.PluginRegistry;
+import io.flutter.plugin.common.PluginRegistry.Registrar;
+import io.flutter.view.FlutterNativeView;
 
-public class RevenuecatPlugin implements MethodCallHandler {
-    private final Registrar registrar;
-    private final MethodChannel channel;
+class PluginListener implements PurchasesListener {
+    RevenuecatPlugin revenuecatPlugin;
 
-    public static void registerWith(Registrar registrar) {
-        final MethodChannel channel = new MethodChannel(registrar.messenger(), "revenuecat");
-        channel.setMethodCallHandler(new RevenuecatPlugin(registrar, channel));
+    private static final String PURCHASE_COMPLETED_EVENT = "purchaseCompleted";
+    private static final String PURCHASER_INFO_UPDATED = "purchaserInfoUpdated";
+    private static final String TRANSACTIONS_RESTORED = "restoredTransactions";
+
+    @Override
+    public void onCompletedPurchase(String sku, PurchaserInfo purchaserInfo) {
+        Map<String, Object> map = new HashMap<>();
+        map.put("productIdentifier", sku);
+        map.put("purchaserInfo", revenuecatPlugin.createPurchaserInfoMap(purchaserInfo));
+        revenuecatPlugin.sendEvent(PURCHASE_COMPLETED_EVENT, map);
     }
 
-    private RevenuecatPlugin(Registrar registrar, MethodChannel channel) {
-        this.registrar = registrar;
-        this.channel = channel;
+    @Override
+    public void onFailedPurchase(@NotNull Purchases.ErrorDomains domain, int code, @Nullable String message) {
+        Map<String, Object> map = new HashMap<>();
+
+        map.put("error", revenuecatPlugin.errorMap(domain, code, message));
+
+        revenuecatPlugin.sendEvent(PURCHASE_COMPLETED_EVENT, map);
+    }
+
+    @Override
+    public void onRestoreTransactionsFailed(@NotNull Purchases.ErrorDomains domain, int code, @Nullable String message) {
+        revenuecatPlugin.sendEvent(TRANSACTIONS_RESTORED, revenuecatPlugin.errorMap(domain, code, message));
+    }
+
+    @Override
+    public void onReceiveUpdatedPurchaserInfo(PurchaserInfo purchaserInfo) {
+        Map<String, Object> map = new HashMap<>();
+
+        map.put("purchaserInfo", revenuecatPlugin.createPurchaserInfoMap(purchaserInfo));
+
+        revenuecatPlugin.sendEvent(PURCHASER_INFO_UPDATED, map);
+    }
+
+    @Override
+    public void onRestoreTransactions(PurchaserInfo purchaserInfo) {
+        Map<String, Object> map = new HashMap<>();
+        map.put("purchaserInfo", revenuecatPlugin.createPurchaserInfoMap(purchaserInfo));
+
+        revenuecatPlugin.sendEvent(TRANSACTIONS_RESTORED, map);
+    }
+}
+
+/** RevenuecatPlugin */
+public class RevenuecatPlugin implements MethodCallHandler {
+    public static PluginListener l;
+
+    /** Plugin registration. */
+    public static void registerWith(Registrar registrar) {
+        final MethodChannel channel = new MethodChannel(registrar.messenger(), "channel:com.flutterplugin.revenuecat/purchases");
+        RevenuecatPlugin plugin = new RevenuecatPlugin(registrar, channel);
+        channel.setMethodCallHandler(plugin);
     }
 
     @Override
     public void onMethodCall(MethodCall call, Result result) {
-        switch (call.method) {
-            case "setDebugLogsEnabled":
-                handleSetDebugLogs(call, result);
+        try {
+            if (call.method.equals("setupPurchases")) {
+                //{'apiKey' : apiKey, 'appUserId' : appUserId}
+                setupPurchases((String) call.argument("apiKey"), (String) call.argument("appUserId"), result);
+            } else if (call.method.equals("setAllowSharingAppStoreAccount")) {
+                setAllowSharingAppStoreAccount((Boolean) call.argument("allowSharingAppStoreAccount"), result);
+            } else if (call.method.equals("getEntitlements")) {
+                getEntitlements(result);
+            } else if (call.method.equals("getProductInfo")) {
+                getProductInfo((ArrayList<String>) call.argument("productIdentifiers"), (String) call.argument("type"), result);
+            } else if (call.method.equals("makePurchase")) {
+                makePurchase((String) call.argument("productIdentifier"), (ArrayList<String>) call.argument("oldSKUs"), (String) call.argument("type"), result);
+            } else if (call.method.equals("restoreTransactions")) {
+                restoreTransactions(result);
+            } else if (call.method.equals("getAppUserID")) {
+                getAppUserID(result);
+            } else if (call.method.equals("addAttributionData")) {
+                addAttributionData((Map<String, Object>) call.argument("data"), (Integer) call.argument("network"), result);
+            } else {
+                result.notImplemented();
+            }
+        } catch (Exception ex){
+            result.error("METHOD_CALL", ex.getLocalizedMessage(), ex);
+        }
+    }
+
+    public void sendEvent(String eventName,
+                           @Nullable Map<String, Object> params) {
+        channel.invokeMethod(eventName, params);
+    }
+
+    private final Registrar registrar;
+    private final MethodChannel channel;
+
+    public RevenuecatPlugin(Registrar registrar, MethodChannel channel) {
+        this.registrar = registrar;
+        this.channel = channel;
+        this.registrar.addViewDestroyListener(new PluginRegistry.ViewDestroyListener() {
+            @Override
+            public boolean onViewDestroy(FlutterNativeView flutterNativeView) {
+                onDestroy();
+                return false;
+            }
+        });
+    }
+
+    private void checkPurchases() {
+        if (Purchases.getSharedInstance() == null) {
+            throw new RuntimeException("You must call setupPurchases first");
+        }
+    }
+
+    public void onDestroy() {
+        if (Purchases.getSharedInstance() != null) {
+            Purchases.getSharedInstance().close();
+        }
+    }
+
+    public void setupPurchases(String apiKey, String appUserID, final Result result) {
+        if (Purchases.getSharedInstance() != null) {
+            Purchases.getSharedInstance().close();
+        }
+        Purchases.Builder builder = new Purchases.Builder(registrar.context(), apiKey);
+        if (appUserID != null) {
+            builder.appUserID(appUserID);
+        }
+        Purchases purchases = builder.build();
+        this.l = new PluginListener();
+        this.l.revenuecatPlugin = this;
+        purchases.setListener(this.l);
+        Purchases.setSharedInstance(purchases);
+        result.success(null);
+    }
+
+    public void setAllowSharingAppStoreAccount(boolean allowSharingAppStoreAccount, Result result) {
+        checkPurchases();
+        Purchases.getSharedInstance().setAllowSharingPlayStoreAccount(allowSharingAppStoreAccount);
+        result.success(null);
+    }
+
+    public void addAttributionData(Map<String, Object> data, Integer network, Result result) {
+        checkPurchases();
+        try {
+            JSONObject object = convertMapToJson(data);
+            Purchases.AttributionNetwork attributionNetwork = null;
+            if (network == Purchases.AttributionNetwork.ADJUST.getServerValue()) {
+                attributionNetwork = Purchases.AttributionNetwork.ADJUST;
+            } else if (network == Purchases.AttributionNetwork.BRANCH.getServerValue()) {
+                attributionNetwork = Purchases.AttributionNetwork.BRANCH;
+            } else if (network == Purchases.AttributionNetwork.APPSFLYER.getServerValue()) {
+                attributionNetwork = Purchases.AttributionNetwork.APPSFLYER;
+            }
+            Purchases.getSharedInstance().addAttributionData(object, attributionNetwork);
+            result.success(null);
+        } catch (JSONException e) {
+            result.error("JSON-PARSE","Error parsing attribution date to JSON" + e.getLocalizedMessage(), null);
+        }
+    }
+
+    private Map<String, Object> mapForSkuDetails(final SkuDetails detail) {
+        Map<String, Object> map = new HashMap<>();
+
+        map.put("identifier", detail.getSku());
+        map.put("description", detail.getDescription());
+        map.put("title", detail.getTitle());
+        map.put("price", ((double) detail.getPriceAmountMicros()) / 1000000);
+        map.put("price_string", detail.getPrice());
+
+        map.put("intro_price", detail.getIntroductoryPriceAmountMicros());
+        map.put("intro_price_string", detail.getIntroductoryPrice());
+        map.put("intro_price_period", detail.getIntroductoryPricePeriod());
+        map.put("intro_price_cycles", detail.getIntroductoryPriceCycles());
+
+        map.put("currency_code", detail.getPriceCurrencyCode());
+
+        return map;
+    }
+
+    public void getEntitlements(final Result result) {
+        checkPurchases();
+
+        Purchases.getSharedInstance().getEntitlements(new Purchases.GetEntitlementsHandler() {
+
+            @Override
+            public void onReceiveEntitlements(Map<String, Entitlement> entitlementMap) {
+                try {
+                    Map<String, Object> response = new HashMap<>();
+
+                    for (String entId : entitlementMap.keySet()) {
+                        Entitlement ent = entitlementMap.get(entId);
+
+                        Map<String, Object> offeringsMap = new HashMap<>();
+                        Map<String, Offering> offerings = ent.getOfferings();
+
+                        for (String offeringId : offerings.keySet()) {
+                            Offering offering = offerings.get(offeringId);
+                            SkuDetails skuDetails = offering.getSkuDetails();
+                            if (skuDetails != null) {
+                                Map<String, Object> skuMap = mapForSkuDetails(skuDetails);
+                                offeringsMap.put(offeringId, skuMap);
+                            } else {
+                                offeringsMap.put(offeringId, null);
+                            }
+                        }
+                        response.put(entId, offeringsMap);
+                    }
+
+                    result.success(response);
+                } catch (Exception e){
+                    result.error("PARSING_ERRORS", e.getLocalizedMessage(), e);
+                }
+            }
+
+            @Override
+            public void onReceiveEntitlementsError(@NotNull Purchases.ErrorDomains errorDomains, int code, @NotNull String message) {
+                result.error("ERROR_FETCHING_ENTITLEMENTS", message, null);
+            }
+        });
+    }
+
+    public void getProductInfo(List<String> productIDs, String type, final Result result) {
+        checkPurchases();
+
+        Purchases.GetSkusResponseHandler handler = new Purchases.GetSkusResponseHandler() {
+            @Override
+            public void onReceiveSkus(List<SkuDetails> skus) {
+                ArrayList<Map> writableArray = new ArrayList<>();
+                for (SkuDetails detail : skus) {
+                    writableArray.add(mapForSkuDetails(detail));
+                }
+
+                result.success(writableArray);
+            }
+        };
+
+        if (type.toLowerCase().equals("subs")) {
+            Purchases.getSharedInstance().getSubscriptionSkus(productIDs, handler);
+        } else {
+            Purchases.getSharedInstance().getNonSubscriptionSkus(productIDs, handler);
+        }
+    }
+
+    public void makePurchase(String productIdentifier, ArrayList<String> oldSkus, String type, Result result) {
+        checkPurchases();
+        Purchases.getSharedInstance().makePurchase(registrar.activity(), productIdentifier, type, oldSkus);
+        result.success(null);
+    }
+
+    public void getAppUserID(final Result result) {
+        result.success(Purchases.getSharedInstance().getAppUserID());
+    }
+
+    public void restoreTransactions(Result result) {
+        checkPurchases();
+        Purchases.getSharedInstance().restorePurchasesForPlayStoreAccount();
+        result.success(null);
+    }
+
+    private static JSONObject convertMapToJson(Map<String, Object> source) throws JSONException {
+        // This method does not support possible byte[], int[], long[], double[]
+        JSONObject object = new JSONObject();
+        Iterator<String> iterator = source.keySet().iterator();
+        while (iterator.hasNext()) {
+            String key = iterator.next();
+            Object value = source.get(key);
+            if (value instanceof Map) {
+                object.put(key, convertMapToJson((Map<String, Object>) value));
+            } else if (value instanceof List) {
+                object.put(key, convertArrayToJson((List) value));
+            } else {
+                object.put(key, value);
+            }
+        }
+        return object;
+    }
+
+    private static JSONArray convertArrayToJson(List source) throws JSONException {
+        // This method does not support possible byte[], int[], long[], double[]
+        JSONArray array = new JSONArray();
+        for (int i = 0; i < source.size(); i++) {
+            Object value = source.get(i);
+            if (value instanceof Map) {
+                array.put(convertMapToJson((Map<String, Object>) value));
+            } else if (value instanceof List) {
+                array.put(convertArrayToJson((List) value));
+            } else {
+                array.put(value);
+            }
+        }
+        return array;
+    }
+
+    public Map<String, Object> createPurchaserInfoMap(PurchaserInfo purchaserInfo) {
+        Map<String, Object> map = new HashMap<>();
+
+        map.put("activeEntitlements", new ArrayList<>(purchaserInfo.getActiveEntitlements()));
+        map.put("activeSubscriptions", new ArrayList<>(purchaserInfo.getActiveSubscriptions()));
+        map.put("allPurchasedProductIdentifiers", new ArrayList<>(purchaserInfo.getAllPurchasedSkus()));
+
+        Date latest = purchaserInfo.getLatestExpirationDate();
+        if (latest != null) {
+            map.put("latestExpirationDate", Iso8601Utils.format(latest));
+        } else {
+            map.put("latestExpirationDate", null);
+        }
+
+        Map<String, String> allExpirationDates = new HashMap<>();
+        Map<String, Date> dates = purchaserInfo.getAllExpirationDatesByProduct();
+        for (Map.Entry<String, Date> entry : dates.entrySet()) {
+            allExpirationDates.put(entry.getKey(), Iso8601Utils.format(entry.getValue()));
+        }
+        map.put("allExpirationDates", allExpirationDates);
+
+        Map<String, String> allEntitlementExpirationDates = new HashMap<>();
+
+        for (String entitlementId : purchaserInfo.getActiveEntitlements()) {
+            Date date = purchaserInfo.getExpirationDateForEntitlement(entitlementId);
+            if (date != null) {
+                allEntitlementExpirationDates.put(entitlementId, Iso8601Utils.format(date));
+            } else {
+                allEntitlementExpirationDates.put(entitlementId, null);
+            }
+        }
+        map.put("expirationsForActiveEntitlements", allEntitlementExpirationDates);
+
+        return map;
+    }
+
+    public Map<String, Object> errorMap(Purchases.ErrorDomains domain, int code, String message) {
+        Map<String, Object> errorMap = new HashMap<>();
+        String domainString;
+
+        switch (domain) {
+            case REVENUECAT_BACKEND:
+                domainString = "RevenueCat Backend";
                 break;
-            case "configure":
-                handleConfigure(call, result);
-                break;
-            case "getEntitlements":
-                handleGetEntitlements(call, result);
-                break;
-            case "makePurchase":
-                handleMakePurchase(call, result);
-                break;
-            case "getPurchaserInfo":
-                handleGetPurchaserInfo(call, result);
+            case PLAY_BILLING:
+                domainString = "Play Billing";
                 break;
             default:
-                result.notImplemented();
-                break;
-        }
-    }
-
-    private void handleGetPurchaserInfo(MethodCall call, final Result result) {
-        Purchases.getSharedInstance().getPurchaserInfo(new ReceivePurchaserInfoListener() {
-            @Override
-            public void onReceived(@NonNull PurchaserInfo purchaserInfo) {
-                Map<String, Object> info = purchaserInfoToMap(purchaserInfo);
-                result.success(info);
-            }
-
-            @Override
-            public void onError(@NonNull PurchasesError error) {
-                result.error("GetPurchaserInfo", error.getMessage(), null);
-            }
-        });
-    }
-
-    private void handleMakePurchase(MethodCall call, final Result result) {
-        Map<String, String> arguments = call.arguments();
-        String sku = arguments.get("sku");
-        String skuType = arguments.get("skuType");
-        Purchases.getSharedInstance().makePurchase(registrar.activity(), sku, skuType, new PurchaseCompletedListener() {
-            @Override
-            public void onCompleted(@NonNull String sku, @NonNull PurchaserInfo purchaserInfo) {
-                Map<String, Object> info = purchaserInfoToMap(purchaserInfo);
-                info.put("sku", sku);
-                result.success(info);
-            }
-
-            @Override
-            public void onError(@NonNull PurchasesError error) {
-                result.error("MakePurchase", error.getMessage(), null);
-            }
-        });
-    }
-
-    private void handleSetDebugLogs(MethodCall call, Result result) {
-        Map<String, Boolean> arguments = call.arguments();
-        boolean enabled = arguments.get("enabled");
-        Purchases.setDebugLogsEnabled(enabled);
-        result.success(null);
-    }
-
-    private void handleConfigure(MethodCall call, Result result) {
-        Map<String, String> arguments = call.arguments();
-        String apiKey = arguments.get("apiKey");
-        String appUserID = arguments.get("appUserID");
-        Purchases.configure(this.registrar.context(), apiKey, appUserID);
-        result.success(null);
-    }
-
-    private void handleGetEntitlements(MethodCall call, final Result result) {
-        Purchases.getSharedInstance().getEntitlements(new ReceiveEntitlementsListener() {
-            @Override
-            public void onReceived(@NonNull Map<String, Entitlement> entitlementMap) {
-                List<Map<String, Object>> entitlementList = new ArrayList<>();
-                for (Map.Entry<String, Entitlement> entry : entitlementMap.entrySet()) {
-                    entitlementList.add(entitlementToMap(entry.getKey(), entry.getValue()));
-                }
-                result.success(entitlementList);
-            }
-
-            @Override
-            public void onError(@NonNull PurchasesError error) {
-                result.error("GetEntitlements", error.getMessage(), null);
-            }
-        });
-    }
-
-    private Map<String, Object> entitlementToMap(String key, Entitlement entitlement) {
-        Map<String, Object> map = new HashMap<>();
-        map.put("key", key);
-
-        List<Map<String, String>> offerings = new ArrayList<>();
-        for (Map.Entry<String, Offering> entry : entitlement.getOfferings().entrySet()) {
-            offerings.add(offeringToMap(entry.getKey(), entry.getValue()));
+                domainString = "Unknown";
         }
 
-        map.put("offerings", offerings);
-        return map;
-    }
+        errorMap.put("message", message);
+        errorMap.put("code", code);
+        errorMap.put("domain", domainString);
 
-    private Map<String, String> offeringToMap(String key, Offering offering) {
-        Map<String, String> map = new HashMap<>();
-        map.put("key", key);
-        map.put("activeProductIdentifier", offering.getActiveProductIdentifier());
-        map.put("freeTrialPeriod", offering.getSkuDetails().getFreeTrialPeriod());
-        map.put("description", offering.getSkuDetails().getDescription());
-        map.put("price", offering.getSkuDetails().getPrice());
-        map.put("currencyCode", offering.getSkuDetails().getPriceCurrencyCode());
-        map.put("sku", offering.getSkuDetails().getSku());
-        map.put("subscriptionPeriod", offering.getSkuDetails().getSubscriptionPeriod());
-        map.put("title", offering.getSkuDetails().getTitle());
-        map.put("type", offering.getSkuDetails().getType());
-        return map;
-    }
-
-    private Map<String, Object> purchaserInfoToMap(PurchaserInfo info) {
-        Map<String, Object> map = new HashMap<>();
-        map.put("activeEntitlements", info.getActiveEntitlements());
-        map.put("activeSubscriptions", info.getActiveSubscriptions());
-        map.put("requestDate", info.getRequestDate());
-        return map;
+        return errorMap;
     }
 }
